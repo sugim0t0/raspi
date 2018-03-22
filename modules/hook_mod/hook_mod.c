@@ -46,78 +46,55 @@ void dump_data(unsigned char* data, int size)
     }
 }
 
-uint16_t calc_ip_cksum(unsigned char* ip_hdr)
+uint16_t calc_cksum(unsigned char* data, int size)
 {
-    int i;
-    uint32_t result = 0;
-    uint16_t *offset = (uint16_t*)ip_hdr;
-    for(i=0; i<10; i++)
+    uint32_t sum = 0;
+    uint16_t *ptr = (uint16_t*)data;
+    int rest;
+
+    for(rest = size; rest > 1; rest -= 2)
     {
-        if(i != 5) // Ignore existed checksum value
-        {
-            result += *offset;
-            if(result > 0xFFFF)
-            {
-                result &= 0xFFFF;
-                result++;
-            }
-        }
-        offset++;
+        sum += *ptr;
+        if(sum > 0xFFFF)
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        ptr++;
     }
-    return (uint16_t)(~result & 0xFFFF);
+    if(rest == 1)
+    {
+        uint16_t val = 0;
+        memcpy(&val, ptr, sizeof(uint8_t));
+        sum += val;
+    }
+    while(sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (uint16_t)~sum;
 }
 
-uint16_t calc_tcp_cksum(unsigned char* tcp_hdr, unsigned char* ip_hdr)
+struct pseudo_ipv4_header {
+    uint32_t src_addr;
+    uint32_t dst_addr;
+    uint8_t  zero;
+    uint8_t  ptcl;
+    uint16_t length;
+};
+
+uint16_t calc_pseudo_ipv4_header(unsigned char* ip_hdr)
 {
-    int i;
-    uint32_t result = 0;
-    uint16_t *offset;
-    uint16_t protocol = 6;
-    uint16_t length = ntohs(*(uint16_t*)(ip_hdr + 2));
-    printk("length: %d\n", length);
-    length -= 20; // 20: Length of IP header
-    // pseudo header
-    offset = (uint16_t*)(ip_hdr + 12);
-    for(i=0; i<4; i++)
-    {
-        result += *offset;
-        if(result > 0xFFFF)
-        {
-            result &= 0xFFFF;
-            result++;
-        }
-        offset++;
-    }
-    //result += htons(protocol);
-    //result += protocol;
-    if(result > 0xFFFF)
-    {
-        result &= 0xFFFF;
-        result++;
-    }
-    //result += htons(length);
-    //result += length;
-    if(result > 0xFFFF)
-    {
-        result &= 0xFFFF;
-        result++;
-    }
-    // TCP header + payload
-    offset = (uint16_t*)tcp_hdr;
-    for(i=0; i<(length/2); i++)
-    {
-        if(i != 8) // Ignore existed checksum value
-        {
-            result += *offset;
-            if(result > 0xFFFF)
-            {
-                result &= 0xFFFF;
-                result++;
-            }
-        }
-        offset++;
-    }
-    return (uint16_t)(~result & 0xFFFF);
+    struct pseudo_ipv4_header pseudo_hdr;
+    uint16_t sum;
+    uint16_t tcp_length = ntohs(*(uint16_t*)(ip_hdr + 2)) - (((*(uint8_t*)(ip_hdr)) & 0x0F) * 4);
+
+    // Pseudo IPv4 header
+    memcpy(&pseudo_hdr.src_addr, (ip_hdr + 12), 4);
+    memcpy(&pseudo_hdr.dst_addr, (ip_hdr + 16), 4);
+    pseudo_hdr.zero = 0;
+    pseudo_hdr.ptcl = 6; // 6: TCP
+    pseudo_hdr.length = htons(tcp_length);
+    sum = calc_cksum((unsigned char*)&pseudo_hdr, sizeof(pseudo_hdr));
+    dump_data((unsigned char*)&pseudo_hdr, sizeof(pseudo_hdr));
+
+    return sum;
 }
 
 unsigned int main_hook
@@ -158,6 +135,7 @@ unsigned int main_hook
     if(be16_to_cpu(tcp_header->source) == PORT_NUMBER)
     {
         int num_skb;
+        uint16_t pseudo_sum;
         /* Scatter/Gather func. check */
 #if 0
         if(!(skb->sk->sk_route_caps & NETIF_F_SG))
@@ -207,41 +185,29 @@ unsigned int main_hook
         if((skb->len - 40) % 1460)
             num_skb++;
         printk("num_skb: %d\n", num_skb);
-#if 0
+        printk("skb->ip_summed: %d\n", skb->ip_summed);
+#if 1
         if(skb->len > 1500)
         {
-            printk("IP len:%u\n", ip_header->tot_len);
+            printk("IP len:%u\n", ntohs(ip_header->tot_len));
             ip_header->tot_len = htons(1500);
             skb->len = 1500;
             skb->tail = skb->data + 1500;
-        }
-#endif
-        printk("IP cksum: %u\n", ip_header->check);
-        printk("recalc IP cksum: %u\n", calc_ip_cksum((unsigned char*)ip_header));
-        printk("TCP cksum: %u\n", tcp_header->check);
-        printk("recalc TCP cksum: %u\n", calc_tcp_cksum((unsigned char*)tcp_header, (unsigned char*)ip_header));
-#if 0
-        if(num_skb > 1)
-        {
-            int i;
-            for(i=0; i<num_skb; i++)
-            {
-                new_skb = __alloc_skb(1500, skb->sk->allocation, SKB_ALLOC_FCLONE, NUMA_NO_NODE);
-                if(!new_skb)
-                {
-                    new_skb->
-                }
-            }
-#endif
-#if 0
-            ip_header->tot_len = 1500;
-            skb->len = 1500;
-            skb->tail = skb->data + 1500;
-            return NF_ACCEPT;
-        }
-        else
-        {
-            return NF_ACCEPT; /* Pass */
+            // recalc IP checksum
+            printk("existed IP cksum: %02x\n", ip_header->check);
+            ip_header->check = 0;
+            ip_header->check = calc_cksum((unsigned char*)ip_header, 20);
+            printk("Recalc IP cksum: %02x\n", ip_header->check);
+            // recalc TCP checksum
+            // Existed TCP cksum value is calculated only part of pseudo IPv4 header.
+            printk("existed TCP cksum: %02x\n", tcp_header->check);
+            tcp_header->check = 0;
+            tcp_header->check = calc_pseudo_ipv4_header((unsigned char*)ip_header);
+            printk("Recalc TCP cksum: %02x\n", tcp_header->check);
+            // payload checksum
+            printk("TCP payload cksum: %02x\n", calc_cksum(skb->data, skb->len));
+            // sk_buff csum
+            printk("skb->csum: %02x\n", skb->csum);
         }
 #endif
     }
