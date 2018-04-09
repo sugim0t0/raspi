@@ -1,8 +1,12 @@
 /**
- * Send/Recv packets hook module by netfilter
+ * Send packets hook module by netfilter
+ * This module segments IP jumbo frame packet.
+ * And creates TCP/IP/Mac headers from original IP packet.
+ *
  * Test Linux kernel version: 4.9.80
  *
  * @author Sugimoto
+ * @version 0.1
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -15,32 +19,48 @@
 #include <net/arp.h>
 #include <net/route.h>
 
-#define RECV_MODE 0
-#define SEND_MODE 1
-//#define HOOK_MODE RECV_MODE
-#define HOOK_MODE SEND_MODE
+#define HW_OFFLOAD              0
 
-#if (HOOK_MODE == RECV_MODE)
-/* 172.29.46.79 */
-#define DST_IP_ADDRESS 0xAC1D2E4F
-#else
 /* 172.29.47.152 */
 #define DST_IP_ADDRESS 0xAC1D2F98
-#endif
-#define PORT_NUMBER 12345
+#define PORT_NUMBER         12345
 
-#define RASPI_CKSUM_OFFLOAD 1
-#define HOOK_PACKET_DROP    0
-#define DEBUG_PRINT         1
+#define HOOK_PACKET_DROP        0
+#define DEBUG_PRINT             1
 
-MODULE_DESCRIPTION("Send/Recv packets hook module by netfilter");
-MODULE_AUTHOR("sugimoto");
+#define TCP_PTCL_NUMBER         6
+#define SIZE_OF_TCP_HDR        20
+#define SIZE_OF_IP_HDR         20
+#define LOCAL_MSS            1460
+#define MAX_NUM_OF_PKT         16
+
+MODULE_DESCRIPTION("Send packets hook module by netfilter");
+MODULE_AUTHOR("Sugimoto");
 MODULE_LICENSE("GPL");
+
+/**
+ * Structure of pseudo IPv4 header for TCP checksum calculation
+ */
+struct pseudo_ipv4_header
+{
+    uint32_t src_addr;
+    uint32_t dst_addr;
+    uint8_t  zero;
+    uint8_t  ptcl;
+    uint16_t length;
+};
 
 /* static variable */
 static struct nf_hook_ops netfilter_ops_in;
 
-/* function */
+/**
+ * Functions
+ */
+/**
+ * Dump data
+ * @param *data : start pointer for dump
+ * @param size  : size of dump data (bytes)
+ */
 void dump_data(unsigned char* data, int size)
 {
     int i;
@@ -50,6 +70,10 @@ void dump_data(unsigned char* data, int size)
     }
 }
 
+/**
+ * Print information of sk_buff
+ * @param *skb : sk_buff
+ */
 void print_skb_info(struct sk_buff *skb)
 {
     printk("---- SKBUF info ----\n");
@@ -63,6 +87,52 @@ void print_skb_info(struct sk_buff *skb)
     printk("--------------------\n");
 }
 
+/**
+ * Print information of IP header
+ * @param *hdr : IP header
+ */
+void print_ip_hdr(struct iphdr *hdr)
+{
+    printk("---- IP header -----\n");
+    printk("len:   %u\n", ntohs(hdr->tot_len));
+    printk("check: %02x\n", ntohs(hdr->check));
+    printk("--------------------\n");
+}
+
+/**
+ * Print information of offload functions
+ * @param *skb : sk_buff
+ */
+void print_offload_func(struct sk_buff *skb)
+{
+    struct tcp_sock *tp = tcp_sk(skb->sk);
+    printk("-- Offload func. ---\n");
+    printk("socket sk_route_caps: %llx\n", skb->sk->sk_route_caps);
+    printk("socket gso type: %d\n", skb->sk->sk_gso_type);
+    printk("socket gso max size: %d\n", skb->sk->sk_gso_max_size);
+    printk("socket gso max segs: %u\n", skb->sk->sk_gso_max_segs);
+    if(skb->dev)
+    {
+        printk("netdev gso max size: %d\n", skb->dev->gso_max_size);
+        printk("netdev gso max segs: %u\n", skb->dev->gso_max_segs);
+    }
+    printk("shinfo gso size: %u\n", skb_shinfo(skb)->gso_size);
+    printk("shinfo gso segs: %u\n", skb_shinfo(skb)->gso_segs);
+    printk("shinfo gso type: %u\n", skb_shinfo(skb)->gso_type);
+    printk("shinfo nr frags: %d\n", skb_shinfo(skb)->nr_frags);
+    printk("tcp mss cache: %u\n", tp->mss_cache);
+    printk("tcp gso_segs: %u\n", tp->gso_segs);
+    printk("NETIF_F_GSO_SHIFT: %d\n", NETIF_F_GSO_SHIFT);
+    printk("--------------------\n");
+}
+
+/**
+ * Calculate checksum
+ * @param *data : start pointer of calculation
+ * @param orig_sum : start sum value to be added
+ * @param size : size of data to be calculated
+ * @return calculated sum value
+ */
 uint16_t calc_cksum(unsigned char* data, uint16_t orig_sum, int size)
 {
     uint32_t sum = orig_sum;
@@ -88,14 +158,11 @@ uint16_t calc_cksum(unsigned char* data, uint16_t orig_sum, int size)
     return (uint16_t)~sum;
 }
 
-struct pseudo_ipv4_header {
-    uint32_t src_addr;
-    uint32_t dst_addr;
-    uint8_t  zero;
-    uint8_t  ptcl;
-    uint16_t length;
-};
-
+/**
+ * Calculate pseudo IPv4 header
+ * @param *ip_hdr : IPv4 header
+ * @return calculated sum value
+ */
 uint16_t calc_pseudo_ipv4_header(unsigned char* ip_hdr)
 {
     struct pseudo_ipv4_header pseudo_hdr;
@@ -106,22 +173,51 @@ uint16_t calc_pseudo_ipv4_header(unsigned char* ip_hdr)
     memcpy(&pseudo_hdr.src_addr, (ip_hdr + 12), 4);
     memcpy(&pseudo_hdr.dst_addr, (ip_hdr + 16), 4);
     pseudo_hdr.zero = 0;
-    pseudo_hdr.ptcl = 6; // 6: TCP
+    pseudo_hdr.ptcl = TCP_PTCL_NUMBER;
     pseudo_hdr.length = htons(tcp_length);
     sum = calc_cksum((unsigned char*)&pseudo_hdr, 0, sizeof(pseudo_hdr));
-    dump_data((unsigned char*)&pseudo_hdr, sizeof(pseudo_hdr));
+    //dump_data((unsigned char*)&pseudo_hdr, sizeof(pseudo_hdr));
 
     return sum;
 }
 
+/**
+ * Set checksums for TCP/IP in each header
+ * @param *skb : sk_buff
+ */
+void set_tcp_ip_cksum(struct sk_buff *skb)
+{
+    struct tcphdr *tcp_header = tcp_hdr(skb);
+    struct iphdr *ip_header = ip_hdr(skb);
+    uint16_t pseudo_sum;
+
+    // Calc IP checksum
+    ip_header->check = 0;
+    ip_header->check = calc_cksum((unsigned char*)ip_header, 0, SIZE_OF_IP_HDR);
+    // Calc TCP checksum
+    tcp_header->check = 0;
+    pseudo_sum = calc_pseudo_ipv4_header((unsigned char*)ip_header);
+    tcp_header->check = calc_cksum(skb->data + SIZE_OF_IP_HDR, ~(pseudo_sum), skb->len - SIZE_OF_IP_HDR);
+#if DEBUG_PRINT
+    printk("TCP checksum: %02x\n", ntohs(tcp_header->check));
+#endif
+    // Set CHECKSUM_COMPLETE to ip_summed for disabling H/W checksum offload.
+    skb->ip_summed = CHECKSUM_COMPLETE;
+}
+
+/**
+ * Get neighbour (ARP entry)
+ * @param *skb : sk_buff
+ * @return neighbour
+ */
 struct neighbour * get_neighbour(struct sk_buff *skb)
 {
     struct neighbour *neigh;
     struct dst_entry *dst = skb_dst(skb);
     struct rtable *rt = (struct rtable *)dst;
     struct net_device *dev = dst->dev;
-
     uint32_t nexthop;
+
     if(rt->rt_gateway)
         nexthop = (uint32_t)rt->rt_gateway;
     else
@@ -133,6 +229,195 @@ struct neighbour * get_neighbour(struct sk_buff *skb)
     return neigh;
 }
 
+/**
+ * Set configurations for IP jumbo frame
+ * To Be Confirmed which parameters are valid!
+ * @param *skb : sk_buff
+ */
+void set_jumbo_frame(struct sk_buff *skb)
+{
+    struct tcp_sock *tp = tcp_sk(skb->sk);
+
+    //netif_set_gso_max_size(in, 16*1460);
+    skb->sk->sk_gso_max_size = MAX_NUM_OF_PKT * LOCAL_MSS;
+    skb->sk->sk_gso_max_segs = MAX_NUM_OF_PKT;
+    tp->mss_cache = MAX_NUM_OF_PKT * LOCAL_MSS;
+    tp->gso_segs = MAX_NUM_OF_PKT;
+    skb->sk->sk_route_caps |= (1 << NETIF_F_GSO_SHIFT);
+    if(!(skb->sk->sk_route_caps & NETIF_F_SG))
+    {
+        skb->sk->sk_route_caps |= NETIF_F_SG;
+    }
+#if DEBUG_PRINT
+    printk("GSO -> ON\n");
+    printk("Scatter/Gather -> ON\n");
+    printk("data_len: %u\n", skb->data_len);
+    printk("len: %u\n", skb->len);
+    printk("skb->ip_summed: %d\n", skb->ip_summed);
+#endif
+}
+
+/**
+ * Allocate new sk_buff for fragment packet
+ * @param *skb : original sk_buff
+ * @return allocated new sk_buff
+ */
+struct sk_buff * alloc_new_skb(struct sk_buff *skb)
+{
+    struct sk_buff *new_skb;
+    uint32_t skb_size = LOCAL_MSS + skb->sk->sk_prot->max_header;
+
+    new_skb = alloc_skb(skb_size, GFP_ATOMIC);
+    if(new_skb == NULL)
+    {
+        printk(KERN_WARNING "alloc new skb failed");
+        return NULL;
+    }
+#if DEBUG_PRINT
+    printk("alloc new skb successed\n");
+#endif
+    new_skb->protocol = htons(ETH_P_IP);
+    skb_put(new_skb, skb_size);
+    new_skb->data += skb->sk->sk_prot->max_header;
+    new_skb->tail += skb->sk->sk_prot->max_header;
+    new_skb->dev = skb->dev;
+    new_skb->protocol = skb->protocol;
+    new_skb->mac_len = skb->mac_len;
+    new_skb->transport_header = (new_skb->data - SIZE_OF_TCP_HDR) - new_skb->head;
+    new_skb->network_header = (new_skb->data - (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR)) - new_skb->head;
+
+    return new_skb;
+}
+
+/**
+ * Create TCP packet
+ * 1) copy TCP payload and TCP/IP header from original sk_buff
+ * 2) update TCP sequence number
+ * @param *skb : created TCP packet sk_buff
+ * @param *payload : head of payload in original sk_buff
+ * @param *template_header : head of IP header in original sk_buff
+ * @param offset : payload offset from head of payload in original sk_buff
+ * @param len : length of payload (bytes)
+ * @param seq : TCP sequence number of original sk_buff
+ */
+void create_tcp_packet
+(
+    struct sk_buff *skb,
+    unsigned char *payload,
+    unsigned char *template_header,
+    uint32_t offset,
+    int len,
+    uint32_t seq
+)
+{
+    struct tcphdr *tcp_header;
+
+    // copy TCP payload from original sk_buff
+    memcpy(skb->data, (payload+offset), len);
+    skb->len = len + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR;
+    // copy TCP/IP header from template header
+    memcpy(skb->data - (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR), template_header, (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR));
+    skb->data -= (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR);
+    // update TCP sequence number
+    tcp_header = tcp_hdr(skb);
+    tcp_header->seq = htonl(seq + offset);
+}
+
+/**
+ * Create MAC header
+ * @param *neigh : neighbour
+ * @param *skb : sk_buff
+ */
+void create_mac_header(struct neighbour *neigh, struct sk_buff *skb)
+{
+    int hh_len = neigh->hh.hh_len;
+    int hh_alen = HH_DATA_ALIGN(hh_len);
+#if DEBUG_PRINT
+    printk("hh_len (length of MAC header): %d\n", hh_len);
+    printk("hh_alen (aligned length of MAC header): %d\n", hh_alen);
+    printk("hh->data >\n");
+    dump_data((unsigned char *)neigh->hh.hh_data, hh_alen);
+#endif
+    memcpy(skb->data - hh_alen, neigh->hh.hh_data, hh_alen);
+    skb_push(skb, hh_len);
+}
+
+/**
+ * Operation for hook packet
+ * @param *skb : hooked packet
+ * @return result of handling hook packet
+ */
+int hook_packet(struct sk_buff *skb)
+{
+    struct neighbour *neigh;
+    struct sock *sk = skb->sk;
+    uint32_t seq = ntohl(tcp_hdr(skb)->seq);
+    unsigned char * template_header = skb->data;
+    unsigned char * payload = skb->data + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR;
+    uint32_t payload_offset = 0;
+    uint16_t payload_len = 0;
+    int16_t xmit_val = 0;
+    int rest_data = skb->len - (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR);
+    struct sk_buff *xmit_skb = NULL;
+
+#if DEBUG_PRINT
+    /* Offload (GSO, Scatter/Gather) func. check */
+    print_offload_func(skb);
+#endif
+    if(!(sk->sk_route_caps & (1 << NETIF_F_GSO_SHIFT)))
+        set_jumbo_frame(skb);
+
+    if(rest_data <= LOCAL_MSS)
+        return NF_ACCEPT;
+
+    neigh = get_neighbour(skb);
+    if(neigh == NULL)
+    {
+        printk(KERN_WARNING "Neighbour is not existed yet.");
+        return NF_ACCEPT;
+    }
+
+    while(rest_data > 0)
+    {
+        // Alloc new sk_buff
+        xmit_skb = alloc_new_skb(skb);
+        if(xmit_skb == NULL)
+            return NF_DROP;
+        // create TCP packet
+        payload_len = (rest_data > LOCAL_MSS)? LOCAL_MSS : rest_data;
+        create_tcp_packet
+        (
+            xmit_skb,
+            payload,
+            template_header,
+            payload_offset,
+            payload_len,
+            seq
+        );
+        xmit_skb->len = payload_len + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR;
+        rest_data -= payload_len;
+        payload_offset += payload_len;
+        xmit_skb->tail = xmit_skb->data + xmit_skb->len;
+        // Change IP frame length in IP header
+        ip_hdr(xmit_skb)->tot_len = htons(xmit_skb->len);
+        // Calc and Set TCP/IP checksum
+        set_tcp_ip_cksum(xmit_skb);
+        // Create MAC header
+        create_mac_header(neigh, xmit_skb);
+        // Transmit sk_buff
+        xmit_val = dev_queue_xmit(xmit_skb);
+        if(xmit_val != NET_XMIT_SUCCESS)
+        {
+            printk(KERN_WARNING "failed to send packet : xmit return value=%d", xmit_val);
+        }
+    }
+
+    return NF_STOLEN;
+}
+
+/**
+ * Hook function (called nf_hook() in __ip_local_out())
+ */
 unsigned int main_hook
 (
     void *priv,
@@ -142,7 +427,6 @@ unsigned int main_hook
 {
     struct tcphdr *tcp_header;
     struct iphdr *ip_header;
-    struct sk_buff *new_skb;
 
     /* Read socket buffer */
     if(skb == NULL)
@@ -173,118 +457,8 @@ unsigned int main_hook
 #if HOOK_PACKET_DROP
         return NF_DROP;
 #else
-        struct neighbour *neigh;
-        int num_skb = 1;
-        uint16_t pseudo_sum;
-        /* Scatter/Gather func. check */
-#if 0
-        if(!(skb->sk->sk_route_caps & NETIF_F_SG))
-        {
-            skb->sk->sk_route_caps |= NETIF_F_SG;
-            printk("Scatter/Gather -> ON\n");
-        }
+        return hook_packet(skb);
 #endif
-        /* GSO func. check */
-        struct tcp_sock *tp = tcp_sk(skb->sk);
-#if DEBUG_PRINT
-        printk("--------------------------\n");
-        printk("socket sk_route_caps: %llx\n", skb->sk->sk_route_caps);
-        printk("socket gso type: %d\n", skb->sk->sk_gso_type);
-        printk("socket gso max size: %d\n", skb->sk->sk_gso_max_size);
-        printk("socket gso max segs: %u\n", skb->sk->sk_gso_max_segs);
-        //printk("netdev gso max size: %d\n", in->gso_max_size);
-        //printk("netdev gso max segs: %u\n", in->gso_max_segs);
-        if(skb->dev)
-        {
-            printk("netdev gso max size: %d\n", skb->dev->gso_max_size);
-            printk("netdev gso max segs: %u\n", skb->dev->gso_max_segs);
-        }
-        printk("shinfo gso size: %u\n", skb_shinfo(skb)->gso_size);
-        printk("shinfo gso segs: %u\n", skb_shinfo(skb)->gso_segs);
-        printk("shinfo gso type: %u\n", skb_shinfo(skb)->gso_type);
-        printk("shinfo nr frags: %d\n", skb_shinfo(skb)->nr_frags);
-        //printk("tcp current mss: %u\n", tcp_current_mss(skb->sk));
-        printk("tcp mss cache: %u\n", tp->mss_cache);
-        printk("tcp gso_segs: %u\n", tp->gso_segs);
-        printk("NETIF_F_GSO_SHIFT: %d\n", NETIF_F_GSO_SHIFT);
-        //dump_data(skb->data, 40);
-#endif
-#if 1
-        if(!(skb->sk->sk_route_caps & (1 << NETIF_F_GSO_SHIFT)))
-        {
-            //netif_set_gso_max_size(in, 16*1460);
-            skb->sk->sk_gso_max_size = 16*1460;
-            skb->sk->sk_gso_max_segs = 16;
-            tp->mss_cache = 16*1460;
-            tp->gso_segs = 16;
-            skb->sk->sk_route_caps |= (1 << NETIF_F_GSO_SHIFT);
-            printk("GSO -> ON\n");
-            printk("data_len: %u\n", skb->data_len);
-            printk("len: %u\n", skb->len);
-            num_skb = (skb->len - 40) / 1460;
-            if((skb->len - 40) % 1460)
-                num_skb++;
-            printk("num_skb: %d\n", num_skb);
-            printk("skb->ip_summed: %d\n", skb->ip_summed);
-        }
-#endif
-
-        neigh = get_neighbour(skb);
-        if(neigh) {
-            int hh_len, hh_alen;
-            skb->protocol = htons(ETH_P_IP);
-#if !RASPI_CKSUM_OFFLOAD
-            // Calc IP checksum
-            printk("existed IP cksum: %02x\n", ntohs(ip_header->check));
-            ip_header->check = 0;
-            ip_header->check = calc_cksum((unsigned char*)ip_header, 0, 20);
-            printk("Recalc IP cksum: %02x\n", ntohs(ip_header->check));
-            // Calc TCP checksum
-            // Existed TCP cksum value is calculated only part of pseudo IPv4 header.
-            printk("existed TCP cksum: %02x\n", ntohs(tcp_header->check));
-            tcp_header->check = 0;
-            pseudo_sum = calc_pseudo_ipv4_header((unsigned char*)ip_header);
-            printk("Recalc TCP cksum: %02x\n", (uint16_t)~(ntohs(pseudo_sum)));
-            tcp_header->check = calc_cksum(skb->data + 20, ~(pseudo_sum), skb->len - 20); 
-            printk("TCP cksum: %02x\n", ntohs(tcp_header->check));
-            //dump_data(skb->data + 20, skb->len - 20);
-#endif /* !RASPI_CKSUM_OFFLOAD */
-            print_skb_info(skb);
-            // Segment Jumbo frame
-            if(skb->len > 1500) {
-                skb->len = 1500;
-                skb->tail = skb->data + 1500;
-                ip_header->tot_len = htons(1500);
-                // Recalc IP checksum
-                ip_header->check = 0;
-                ip_header->check = calc_cksum((unsigned char*)ip_header, 0, 20);
-                // Recalc TCP checksum
-                tcp_header->check = 0;
-#if !RASPI_CKSUM_OFFLOAD
-                pseudo_sum = calc_pseudo_ipv4_header((unsigned char*)ip_header);
-                tcp_header->check = calc_cksum(skb->data + 20, ~(pseudo_sum), skb->len - 20); 
-#else
-                tcp_header->check = calc_pseudo_ipv4_header((unsigned char*)ip_header);
-                printk("recalc tcp cksum: %02x\n", tcp_header->check);
-#endif
-            }
-            // Create MAC header
-            hh_len = neigh->hh.hh_len;
-            hh_alen = HH_DATA_ALIGN(hh_len);
-            printk("hh_len: %d\n", hh_len);
-            printk("hh_alen: %d\n", hh_alen);
-            printk("hh->data >\n");
-            dump_data(neigh->hh.hh_data, hh_alen);
-            memcpy(skb->data - hh_alen, neigh->hh.hh_data, hh_alen);
-            skb_push(skb, hh_len);
-            // Transmit sk_buff
-            dev_queue_xmit(skb);
-            return NF_STOLEN;
-        }
-        else {
-            printk("Neighbour is not existed yet.\n");
-        }
-#endif /* HOOK_PACKET_DROP */
     }
 
     return NF_ACCEPT; /* Pass */
@@ -307,11 +481,7 @@ static int hookmod_init_module(void)
     /* Hook condition */
     netfilter_ops_in.hook = main_hook;
     netfilter_ops_in.pf = PF_INET;
-#if (HOOK_MODE == RECV_MODE)
-    netfilter_ops_in.hooknum = NF_INET_LOCAL_IN; /* input */
-#else
     netfilter_ops_in.hooknum = NF_INET_LOCAL_OUT; /* output */
-#endif
     netfilter_ops_in.priority = NF_IP_PRI_FIRST; /* First priority */
 
     /* Register hook API to NetFilter */
