@@ -16,23 +16,32 @@
 #include <linux/netfilter_ipv4.h>
 #include <linux/skbuff.h>
 #include <linux/tcp.h>
+#include <linux/mm.h>
 #include <net/arp.h>
 #include <net/route.h>
+#include <net/sock.h>
 
-#define HW_OFFLOAD              0
-
-/* 172.29.47.152 */
-#define DST_IP_ADDRESS 0xAC1D2F98
+/* 172.29.46.135 */
+#define DST_IP_ADDRESS 0xAC1D2E87
 #define PORT_NUMBER         12345
 
 #define HOOK_PACKET_DROP        0
 #define DEBUG_PRINT             1
+#define CKSUM_PRINT             0
 
 #define TCP_PTCL_NUMBER         6
 #define SIZE_OF_TCP_HDR        20
 #define SIZE_OF_IP_HDR         20
 #define LOCAL_MSS            1460
 #define MAX_NUM_OF_PKT         16
+
+/* IP jumbo frame mode */
+#define NO_JUMBO_MODE 0
+#define FAKE_MSS_MODE 1
+#define SG_GSO_MODE   2
+//#define JUMBO_FRAME_MODE NO_JUMBO_MODE
+//#define JUMBO_FRAME_MODE FAKE_MSS_MODE
+#define JUMBO_FRAME_MODE SG_GSO_MODE /* SG_GSO_MODE is very slow now! 2018.05.16 */
 
 MODULE_DESCRIPTION("Send packets hook module by netfilter");
 MODULE_AUTHOR("Sugimoto");
@@ -79,11 +88,42 @@ void print_skb_info(struct sk_buff *skb)
     printk("---- SKBUF info ----\n");
     printk("len:       %u\n", skb->len);
     printk("data_len:  %u\n", skb->data_len);
+    if(skb->data_len > 0 && skb->end != NULL)
+    {
+        struct skb_shared_info *sh = (struct skb_shared_info *)skb->end;
+        struct sk_buff *skb_frag;
+        int n;
+        unsigned long pageaddr;
+        printk("    == SKB_SHARED_INFO ==\n");
+        printk("    nr_frags:  %u\n", sh->nr_frags);
+        printk("    gso_size:  %u\n", sh->gso_size);
+        printk("    gso_segs:  %u\n", sh->gso_segs);
+        skb_frag = sh->frag_list;
+        while(skb_frag)
+        {
+            printk("    frag_list[%d] len: %u\n", n++, skb_frag->len);
+            skb_frag = skb_frag->next;
+        }
+        for(n = 0; n < MAX_SKB_FRAGS; n++)
+        {
+            if(sh->frags[n].size == 0)
+                break;
+            printk("    frags[%d] size:         %u\n", n, sh->frags[n].size);
+            pageaddr = (unsigned long)page_address(sh->frags[n].page.p);
+            printk("    frags[%d] page address: %lx\n", n, pageaddr);
+            printk("    frags[%d] page offset:  %u\n", n, sh->frags[n].page_offset);
+            dump_data((unsigned char *)(pageaddr + sh->frags[n].page_offset), 10);
+        }
+        printk("    =====================\n");
+    }
     printk("head addr: %p\n", skb->head);
     printk("data addr: %p\n", skb->data);
     printk("tail addr: %p\n", skb->tail);
     printk("end addr:  %p\n", skb->end);
+#if CKSUM_PRINT
     printk("csum:      %u\n", skb->csum);
+    printk("ip_summed: %d\n", skb->ip_summed);
+#endif
     printk("--------------------\n");
 }
 
@@ -108,6 +148,10 @@ void print_offload_func(struct sk_buff *skb)
     struct tcp_sock *tp = tcp_sk(skb->sk);
     printk("-- Offload func. ---\n");
     printk("socket sk_route_caps: %llx\n", skb->sk->sk_route_caps);
+    if(sk_can_gso(skb->sk))
+        printk("can gso\n");
+    else
+        printk("cannot gso\n");
     printk("socket gso type: %d\n", skb->sk->sk_gso_type);
     printk("socket gso max size: %d\n", skb->sk->sk_gso_max_size);
     printk("socket gso max segs: %u\n", skb->sk->sk_gso_max_segs);
@@ -198,7 +242,7 @@ void set_tcp_ip_cksum(struct sk_buff *skb)
     tcp_header->check = 0;
     pseudo_sum = calc_pseudo_ipv4_header((unsigned char*)ip_header);
     tcp_header->check = calc_cksum(skb->data + SIZE_OF_IP_HDR, ~(pseudo_sum), skb->len - SIZE_OF_IP_HDR);
-#if DEBUG_PRINT
+#if CKSUM_PRINT
     printk("TCP checksum: %02x\n", ntohs(tcp_header->check));
 #endif
     // Set CHECKSUM_COMPLETE to ip_summed for disabling H/W checksum offload.
@@ -237,23 +281,29 @@ struct neighbour * get_neighbour(struct sk_buff *skb)
 void set_jumbo_frame(struct sk_buff *skb)
 {
     struct tcp_sock *tp = tcp_sk(skb->sk);
-
+#if JUMBO_FRAME_MODE == FAKE_MSS_MODE
+    tp->mss_cache = MAX_NUM_OF_PKT * LOCAL_MSS;
+#elif JUMBO_FRAME_MODE == SG_GSO_MODE
     //netif_set_gso_max_size(in, 16*1460);
     skb->sk->sk_gso_max_size = MAX_NUM_OF_PKT * LOCAL_MSS;
     skb->sk->sk_gso_max_segs = MAX_NUM_OF_PKT;
-    tp->mss_cache = MAX_NUM_OF_PKT * LOCAL_MSS;
     tp->gso_segs = MAX_NUM_OF_PKT;
     skb->sk->sk_route_caps |= (1 << NETIF_F_GSO_SHIFT);
+#if DEBUG_PRINT
+    printk("GSO -> ON\n");
+#endif
     if(!(skb->sk->sk_route_caps & NETIF_F_SG))
     {
         skb->sk->sk_route_caps |= NETIF_F_SG;
     }
 #if DEBUG_PRINT
-    printk("GSO -> ON\n");
     printk("Scatter/Gather -> ON\n");
-    printk("data_len: %u\n", skb->data_len);
-    printk("len: %u\n", skb->len);
-    printk("skb->ip_summed: %d\n", skb->ip_summed);
+#endif
+#endif
+    // 2018.05.10 Test
+#if 0
+    skb->dev->gso_partial_features |= NETIF_F_GSO_PARTIAL | NETIF_F_GSO_IPXIP4;
+    skb->dev->features |= NETIF_F_GSO_PARTIAL | NETIF_F_GSO_IPXIP4;
 #endif
 }
 
@@ -293,34 +343,86 @@ struct sk_buff * alloc_new_skb(struct sk_buff *skb)
  * Create TCP packet
  * 1) copy TCP payload and TCP/IP header from original sk_buff
  * 2) update TCP sequence number
+ * @param *org_skb : original sk_buff
  * @param *skb : created TCP packet sk_buff
- * @param *payload : head of payload in original sk_buff
- * @param *template_header : head of IP header in original sk_buff
  * @param offset : payload offset from head of payload in original sk_buff
  * @param len : length of payload (bytes)
  * @param seq : TCP sequence number of original sk_buff
  */
 void create_tcp_packet
 (
+    struct sk_buff *org_skb,
     struct sk_buff *skb,
-    unsigned char *payload,
-    unsigned char *template_header,
     uint32_t offset,
     int len,
     uint32_t seq
 )
 {
     struct tcphdr *tcp_header;
+    unsigned char *payload = org_skb->data + SIZE_OF_IP_HDR + SIZE_OF_TCP_HDR;
+    unsigned char *template_header = org_skb->data;
+    uint32_t local_offset = offset;
+    int n;
+    int copied_len = 0;
+    int inner_data_len = org_skb->len - (org_skb->data_len + SIZE_OF_IP_HDR + SIZE_OF_TCP_HDR);
+    struct skb_shared_info *sh = (struct skb_shared_info *)org_skb->end;
+    unsigned long pageaddr;
+    int copy_len;
 
+#if DEBUG_PRINT
+    printk("-- Create TCP packet --\n");
+    printk("size:   %d\n", len);
+    printk("seq:    %x\n", seq + offset);
+    printk("offset: %u\n", offset);
+#endif
     // copy TCP payload from original sk_buff
-    memcpy(skb->data, (payload+offset), len);
-    skb->len = len + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR;
+    if(inner_data_len > 0)
+    {
+        if(offset < inner_data_len)
+        {
+            copied_len = (len > (inner_data_len - offset))? (inner_data_len - offset) : len;
+            memcpy(skb->data, (payload + offset), copied_len);
+            local_offset -= copied_len;
+        }
+        else
+        {
+            local_offset -= inner_data_len;
+        }
+    }
+    // copy TCP payload from pages
+    for(n = 0; len > copied_len && n < MAX_SKB_FRAGS; n++)
+    {
+        if(local_offset > sh->frags[n].size)
+        {
+            local_offset -= sh->frags[n].size;
+            copied_len += sh->frags[n].size;
+            continue;
+        }
+        pageaddr = (unsigned long)page_address(sh->frags[n].page.p);
+        copy_len = ((sh->frags[n].size - local_offset) > (len - copied_len))? (len - copied_len) : (sh->frags[n].size - local_offset);
+#if DEBUG_PRINT
+        printk("    == Copy payload from page (frags[%d]) ==\n", n);
+        printk("    page addr:    %lx\n", pageaddr);
+        printk("    page size:    %u\n", sh->frags[n].size);
+        printk("    page offset:  %u\n", sh->frags[n].page_offset);
+        printk("    local offset: %u\n", local_offset);
+        printk("    copy size:    %d\n", copy_len);
+        printk("    =======================================\n");
+#endif
+        memcpy((skb->data + copied_len), (unsigned char *)pageaddr + sh->frags[n].page_offset + local_offset, copy_len);
+        copied_len += copy_len;
+        local_offset = 0;
+    }
     // copy TCP/IP header from template header
     memcpy(skb->data - (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR), template_header, (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR));
     skb->data -= (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR);
+    skb->len = len + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR;
     // update TCP sequence number
     tcp_header = tcp_hdr(skb);
     tcp_header->seq = htonl(seq + offset);
+#if DEBUG_PRINT
+    printk("-----------------------\n");
+#endif
 }
 
 /**
@@ -332,7 +434,7 @@ void create_mac_header(struct neighbour *neigh, struct sk_buff *skb)
 {
     int hh_len = neigh->hh.hh_len;
     int hh_alen = HH_DATA_ALIGN(hh_len);
-#if DEBUG_PRINT
+#if CKSUM_PRINT
     printk("hh_len (length of MAC header): %d\n", hh_len);
     printk("hh_alen (aligned length of MAC header): %d\n", hh_alen);
     printk("hh->data >\n");
@@ -350,10 +452,10 @@ void create_mac_header(struct neighbour *neigh, struct sk_buff *skb)
 int hook_packet(struct sk_buff *skb)
 {
     struct neighbour *neigh;
+#if JUMBO_FRAME_MODE == SG_GSO_MODE
     struct sock *sk = skb->sk;
+#endif
     uint32_t seq = ntohl(tcp_hdr(skb)->seq);
-    unsigned char * template_header = skb->data;
-    unsigned char * payload = skb->data + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR;
     uint32_t payload_offset = 0;
     uint16_t payload_len = 0;
     int16_t xmit_val = 0;
@@ -361,11 +463,16 @@ int hook_packet(struct sk_buff *skb)
     struct sk_buff *xmit_skb = NULL;
 
 #if DEBUG_PRINT
-    /* Offload (GSO, Scatter/Gather) func. check */
+    print_skb_info(skb);
     print_offload_func(skb);
 #endif
+
+#if JUMBO_FRAME_MODE == SG_GSO_MODE
     if(!(sk->sk_route_caps & (1 << NETIF_F_GSO_SHIFT)))
         set_jumbo_frame(skb);
+#elif JUMBO_FRAME_MODE == FAKE_MSS_MODE
+    set_jumbo_frame(skb);
+#endif
 
     if(rest_data <= LOCAL_MSS)
         return NF_ACCEPT;
@@ -383,13 +490,12 @@ int hook_packet(struct sk_buff *skb)
         xmit_skb = alloc_new_skb(skb);
         if(xmit_skb == NULL)
             return NF_DROP;
-        // create TCP packet
+        // Create TCP packet
         payload_len = (rest_data > LOCAL_MSS)? LOCAL_MSS : rest_data;
         create_tcp_packet
         (
+            skb,
             xmit_skb,
-            payload,
-            template_header,
             payload_offset,
             payload_len,
             seq
@@ -410,13 +516,14 @@ int hook_packet(struct sk_buff *skb)
         {
             printk(KERN_WARNING "failed to send packet : xmit return value=%d", xmit_val);
         }
+        // Delete allocated sk_buff
     }
 
     return NF_STOLEN;
 }
 
 /**
- * Hook function (called nf_hook() in __ip_local_out())
+ * Hook function (called from nf_hook() in include/linux/netfilter.h)
  */
 unsigned int main_hook
 (
