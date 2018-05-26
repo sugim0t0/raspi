@@ -20,13 +20,14 @@
 #include <net/arp.h>
 #include <net/route.h>
 #include <net/sock.h>
+#include <net/tcp.h>
 
-/* 172.29.46.135 */
-#define DST_IP_ADDRESS 0xAC1D2E87
+/* 172.29.47.64 */
+#define DST_IP_ADDRESS 0xAC1D2F40
 #define PORT_NUMBER         12345
 
 #define HOOK_PACKET_DROP        0
-#define DEBUG_PRINT             1
+#define DEBUG_PRINT             0 /* DEBUG_PRINT mode is very slow! 2018.05.25 */
 #define CKSUM_PRINT             0
 
 #define TCP_PTCL_NUMBER         6
@@ -41,7 +42,10 @@
 #define SG_GSO_MODE   2
 //#define JUMBO_FRAME_MODE NO_JUMBO_MODE
 //#define JUMBO_FRAME_MODE FAKE_MSS_MODE
-#define JUMBO_FRAME_MODE SG_GSO_MODE /* SG_GSO_MODE is very slow now! 2018.05.16 */
+#define JUMBO_FRAME_MODE SG_GSO_MODE
+
+/* Replace new fragmented IP frames with jumbo IP frame in sk_write_queue */
+#define REPLACE_FRAMES_IN_QUEUE 1 /* REPLACE_FRAMES_IN_QUEUE has bugs to happen retransmissions 2018.05.25 */
 
 MODULE_DESCRIPTION("Send packets hook module by netfilter");
 MODULE_AUTHOR("Sugimoto");
@@ -86,6 +90,8 @@ void dump_data(unsigned char* data, int size)
 void print_skb_info(struct sk_buff *skb)
 {
     printk("---- SKBUF info ----\n");
+    printk("cloned:    %s\n", (skb->cloned ? "true" : "false")); 
+    printk("users:     %d\n", skb->users.counter);
     printk("len:       %u\n", skb->len);
     printk("data_len:  %u\n", skb->data_len);
     if(skb->data_len > 0 && skb->end != NULL)
@@ -96,6 +102,8 @@ void print_skb_info(struct sk_buff *skb)
         unsigned long pageaddr;
         printk("    == SKB_SHARED_INFO ==\n");
         printk("    nr_frags:  %u\n", sh->nr_frags);
+        printk("    dataref(Higher 16bit): %d\n", (sh->dataref.counter >> SKB_DATAREF_SHIFT));
+        printk("    dataref(Lower  16bit): %d\n", (sh->dataref.counter & SKB_DATAREF_MASK));
         printk("    gso_size:  %u\n", sh->gso_size);
         printk("    gso_segs:  %u\n", sh->gso_segs);
         skb_frag = sh->frag_list;
@@ -104,7 +112,7 @@ void print_skb_info(struct sk_buff *skb)
             printk("    frag_list[%d] len: %u\n", n++, skb_frag->len);
             skb_frag = skb_frag->next;
         }
-        for(n = 0; n < MAX_SKB_FRAGS; n++)
+        for(n = 0; n < MAX_SKB_FRAGS && n < sh->nr_frags; n++)
         {
             if(sh->frags[n].size == 0)
                 break;
@@ -125,6 +133,31 @@ void print_skb_info(struct sk_buff *skb)
     printk("ip_summed: %d\n", skb->ip_summed);
 #endif
     printk("--------------------\n");
+}
+
+/**
+ * Print information of sk_write_queue
+ * @param *sk : socket
+ */
+void print_sk_write_queue_info(struct sock *sk)
+{
+    int i;
+    int num_of_buf = (int)sk->sk_write_queue.qlen;
+    struct sk_buff *skb = sk->sk_write_queue.next;
+    printk("= WRITE QUEUE info =\n");
+    printk("qlen: %d\n", num_of_buf);
+    if(sk->sk_send_head)
+    {
+        printk("sk_send_head: %p\n", sk->sk_send_head);
+        printk("sk_send_head->data: %p\n", sk->sk_send_head->data);
+    }
+    for(i = 1; i < num_of_buf; i++)
+    {
+        printk("buf[%d] >\n", i);
+        print_skb_info(skb);
+        skb = skb->next;
+    }
+    printk("====================\n");
 }
 
 /**
@@ -323,9 +356,6 @@ struct sk_buff * alloc_new_skb(struct sk_buff *skb)
         printk(KERN_WARNING "alloc new skb failed");
         return NULL;
     }
-#if DEBUG_PRINT
-    printk("alloc new skb successed\n");
-#endif
     new_skb->protocol = htons(ETH_P_IP);
     skb_put(new_skb, skb_size);
     new_skb->data += skb->sk->sk_prot->max_header;
@@ -335,6 +365,10 @@ struct sk_buff * alloc_new_skb(struct sk_buff *skb)
     new_skb->mac_len = skb->mac_len;
     new_skb->transport_header = (new_skb->data - SIZE_OF_TCP_HDR) - new_skb->head;
     new_skb->network_header = (new_skb->data - (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR)) - new_skb->head;
+#if DEBUG_PRINT
+    printk("alloc new skb successed\n");
+    print_skb_info(new_skb);
+#endif
 
     return new_skb;
 }
@@ -452,7 +486,7 @@ void create_mac_header(struct neighbour *neigh, struct sk_buff *skb)
 int hook_packet(struct sk_buff *skb)
 {
     struct neighbour *neigh;
-#if JUMBO_FRAME_MODE == SG_GSO_MODE
+#if JUMBO_FRAME_MODE == SG_GSO_MODE || REPLACE_FRAMES_IN_QUEUE
     struct sock *sk = skb->sk;
 #endif
     uint32_t seq = ntohl(tcp_hdr(skb)->seq);
@@ -461,6 +495,10 @@ int hook_packet(struct sk_buff *skb)
     int16_t xmit_val = 0;
     int rest_data = skb->len - (SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR);
     struct sk_buff *xmit_skb = NULL;
+#if REPLACE_FRAMES_IN_QUEUE
+    struct sk_buff *prev = NULL;
+    struct sk_buff *xmit_clone = NULL;
+#endif
 
 #if DEBUG_PRINT
     print_skb_info(skb);
@@ -510,14 +548,70 @@ int hook_packet(struct sk_buff *skb)
         set_tcp_ip_cksum(xmit_skb);
         // Create MAC header
         create_mac_header(neigh, xmit_skb);
+#if DEBUG_PRINT
+        printk("++ New fragmented SKB ++\n");
+        print_skb_info(xmit_skb);
+        printk("++++++++++++++++++++++++\n");
+#endif
+#if REPLACE_FRAMES_IN_QUEUE
+        xmit_clone = skb_clone(xmit_skb, GFP_ATOMIC);
+        if(xmit_clone == NULL)
+        {
+            kfree_skb(xmit_skb);
+            return NF_DROP;
+        }
+        // Maybe it's necessary to reset xmit_clone->data to TCP payload..
+        // Insert xmit_clone into write_queue
+        if(prev == NULL)
+        {
+            // Search original skb in write_queue
+            int i;
+            int num_of_buf = (int)sk->sk_write_queue.qlen;
+            struct sk_buff *skb_queue = sk->sk_write_queue.next;
+            for(i = 1; i < num_of_buf; i++)
+            {
+                if(skb_queue->data == skb->data + SIZE_OF_TCP_HDR + SIZE_OF_IP_HDR)
+                {
+                    printk("Discover cloned skb in write_queue!\n");
+                    break;
+                }
+                skb_queue = skb_queue->next;
+            }
+            if(i >= num_of_buf)
+            {
+                printk("Not discover cloned skb in write_queue..\n");
+                kfree_skb(xmit_skb);
+                kfree_skb(xmit_clone);
+                return NF_DROP;
+            }
+#if DEBUG_PRINT
+            printk("Original hooked sk_buff >\n");
+            print_skb_info(skb);
+            print_sk_write_queue_info(sk);
+#endif
+            tcp_insert_write_queue_before(xmit_clone, skb_queue, sk);
+            // Unlink jumbo IP frame from write_queue
+            skb_unlink(skb_queue, &sk->sk_write_queue);
+            // Free jumbo IP frame in write_queue
+            kfree_skb(skb_queue);
+        }
+        else
+        {
+            tcp_insert_write_queue_after(prev, xmit_clone, sk);
+        }
+        //printk("insert skb seq: %x\n", ntohl(tcp_hdr(xmit_clone)->seq));
+        prev = xmit_clone;
+        sk->sk_send_head = xmit_clone;
+#endif
         // Transmit sk_buff
         xmit_val = dev_queue_xmit(xmit_skb);
         if(xmit_val != NET_XMIT_SUCCESS)
         {
             printk(KERN_WARNING "failed to send packet : xmit return value=%d", xmit_val);
         }
-        // Delete allocated sk_buff
     }
+    // Free hooked jumbo IP frame
+    kfree_skb(skb);
 
     return NF_STOLEN;
 }
